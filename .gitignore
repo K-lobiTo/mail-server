@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.env
+*.log
+
+# Certificates
+certs/*.key
+certs/*.crt
+certs/*.pem
+
+# Mail storage
+storage/
+*.eml
+
+# IDE
+.vscode/
+.idea/
+
