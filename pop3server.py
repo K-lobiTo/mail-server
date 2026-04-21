@@ -5,10 +5,12 @@ pop3server.py -s <mail-storage> -p <port>
 
 import argparse
 from pathlib import Path
+from io import BytesIO
 
 from twisted.internet import reactor, defer, ssl
 from twisted.mail import pop3
 from twisted.internet.protocol import Factory
+from twisted.cred import portal, checkers, credentials, error as credError
 from zope.interface import implementer
 
 
@@ -39,7 +41,6 @@ class Mailbox:
     def getMessage(self, index):
         if index in self.deleted:
             return defer.fail(pop3.MessageDeleted())
-        from io import BytesIO
         with open(self.messages[index], 'rb') as f:
             return defer.succeed(BytesIO(f.read()))
 
@@ -78,35 +79,76 @@ class Mailbox:
         return defer.succeed(total)
 
 
-class POP3Server(pop3.POP3):
-    def authenticateUserPass(self, user, password):
-        user_str = user.decode() if isinstance(user, bytes) else user
-        print(f"🔐 Login: {user_str}")
+@implementer(portal.IRealm)
+class MailRealm:
+    """Conecta un usuario autenticado con su Mailbox"""
 
-        storage = self.factory.mail_storage
+    def __init__(self, mail_storage):
+        self.mail_storage = Path(mail_storage)
+
+    def requestAvatar(self, avatarId, mind, *interfaces):
+        if pop3.IMailbox not in interfaces:
+            raise NotImplementedError("Solo soportamos IMailbox")
+
+        # avatarId es el username como bytes o str
+        user_str = avatarId.decode() if isinstance(avatarId, bytes) else avatarId
+        print(f"📬 Abriendo mailbox para: {user_str}")
+
+        # Buscar carpeta usuario_at_dominio
         user_dir = None
-        for candidate in Path(storage).iterdir():
+        for candidate in self.mail_storage.iterdir():
             if candidate.name.startswith(user_str + "_at_"):
                 user_dir = candidate
                 break
 
         if user_dir is None:
-            print(f"❌ Usuario no encontrado: {user_str}")
-            return defer.fail(pop3.LoginFailed("Usuario no encontrado"))
+            # Si no existe, crearla vacía (primer login)
+            user_dir = self.mail_storage / f"{user_str}_at_klob.me"
+            user_dir.mkdir(parents=True, exist_ok=True)
+            (user_dir / "inbox").mkdir(exist_ok=True)
+            print(f"📁 Carpeta creada: {user_dir}")
 
-        print(f"✅ Autenticado: {user_str} → {user_dir}")
-        return defer.succeed(Mailbox(user_dir))
+        mailbox = Mailbox(user_dir)
+        return (pop3.IMailbox, mailbox, lambda: None)
+
+
+@implementer(checkers.ICredentialsChecker)
+class AnyPasswordChecker:
+    """Acepta cualquier contraseña si el usuario tiene carpeta en storage"""
+
+    credentialInterfaces = (credentials.IUsernamePassword,)
+
+    def __init__(self, mail_storage):
+        self.mail_storage = Path(mail_storage)
+
+    def requestAvatarId(self, creds):
+        user_str = creds.username.decode() if isinstance(creds.username, bytes) else creds.username
+        print(f"🔐 Autenticando: {user_str}")
+
+        # Buscar si existe carpeta para este usuario
+        for candidate in self.mail_storage.iterdir():
+            if candidate.name.startswith(user_str + "_at_"):
+                print(f"✅ Usuario encontrado: {user_str}")
+                return defer.succeed(creds.username)
+
+        # Si no existe la carpeta, igual permitir (se crea en requestAvatar)
+        print(f"✅ Usuario nuevo, se creará carpeta: {user_str}")
+        return defer.succeed(creds.username)
 
 
 class POP3Factory(Factory):
-    protocol = POP3Server
+    protocol = pop3.POP3
 
     def __init__(self, mail_storage):
         self.mail_storage = mail_storage
+        checker = AnyPasswordChecker(mail_storage)
+        realm = MailRealm(mail_storage)
+        self.portal = portal.Portal(realm, [checker])
 
     def buildProtocol(self, addr):
         p = self.protocol()
         p.factory = self
+        p.portal = self.portal
         return p
 
 
