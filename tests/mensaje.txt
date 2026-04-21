@@ -1,0 +1,7 @@
+Hola {{nombre}},
+
+Este es tu correo de bienvenida.
+Tu dirección registrada es: {{email}}
+
+Saludos,
+El equipo de klob.me
