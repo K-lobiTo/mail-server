@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Notificador XMPP - alerta cuando llega un nuevo correo
-Se integra con el SMTP server monitoreando el storage
+notifier.py --jid <bot_jid> --password <pass> --notify <user_jid> -s <mail-storage>
 """
 
 import asyncio
 import argparse
-import time
+import json
+import threading
 from pathlib import Path
+
 import slixmpp
 
 
 class MailNotifier(slixmpp.ClientXMPP):
-    """Cliente XMPP que notifica nuevos correos"""
 
     def __init__(self, jid, password, notify_jid, mail_storage):
         super().__init__(jid, password)
@@ -21,34 +21,43 @@ class MailNotifier(slixmpp.ClientXMPP):
         self.seen_files = set()
 
         self.add_event_handler("session_start", self.on_connect)
+        self.add_event_handler("failed_auth", self.on_failed_auth)
+
+    async def on_failed_auth(self, event):
+        print("❌ Autenticación XMPP fallida — verifica JID y contraseña")
+        self.disconnect()
 
     async def on_connect(self, event):
         self.send_presence()
         await self.get_roster()
         print(f"✅ XMPP conectado como {self.boundjid}")
         print(f"📡 Monitoreando: {self.mail_storage}")
+        print(f"🔔 Notificando a: {self.notify_jid}")
+
+        # Registrar archivos existentes para no notificar correos viejos
+        for eml in self.mail_storage.rglob("*.eml"):
+            self.seen_files.add(str(eml))
+        print(f"📂 {len(self.seen_files)} correos existentes ignorados (solo nuevos serán notificados)")
+
         asyncio.ensure_future(self.watch_mailbox())
 
     async def watch_mailbox(self):
-        """Monitorea el storage y notifica nuevos .eml"""
-        # Inicializar con archivos existentes
-        for eml in self.mail_storage.rglob("*.eml"):
-            self.seen_files.add(str(eml))
-
+        """Monitorea el storage cada 5 segundos"""
         while True:
-            await asyncio.sleep(5)  # revisar cada 5 segundos
-            for eml in self.mail_storage.rglob("*.eml"):
-                path_str = str(eml)
-                if path_str not in self.seen_files:
-                    self.seen_files.add(path_str)
-                    await self.notify_new_mail(eml)
+            await asyncio.sleep(5)
+            try:
+                for eml in self.mail_storage.rglob("*.eml"):
+                    path_str = str(eml)
+                    if path_str not in self.seen_files:
+                        self.seen_files.add(path_str)
+                        await self.notify_new_mail(eml)
+            except Exception as e:
+                print(f"⚠️ Error en watch: {e}")
 
     async def notify_new_mail(self, eml_path):
-        """Envía notificación XMPP"""
-        # Leer metadata del .json si existe
+        """Envía notificación XMPP con detalles del correo"""
         json_path = eml_path.with_suffix('.json')
         if json_path.exists():
-            import json
             with open(json_path) as f:
                 meta = json.load(f)
             msg_text = (
@@ -60,25 +69,36 @@ class MailNotifier(slixmpp.ClientXMPP):
         else:
             msg_text = f"📧 Nuevo correo recibido: {eml_path.name}"
 
-        print(f"🔔 Notificando: {msg_text}")
+        print(f"🔔 Enviando notificación XMPP:\n{msg_text}")
         self.send_message(mto=self.notify_jid, mbody=msg_text, mtype='chat')
 
 
 def main():
     parser = argparse.ArgumentParser(description="Notificador XMPP de correos")
-    parser.add_argument("--jid", required=True,
-                        help="Tu JID XMPP (ej: bot@jabber.org)")
-    parser.add_argument("--password", required=True,
-                        help="Contraseña XMPP")
-    parser.add_argument("--notify", required=True,
-                        help="JID a notificar (ej: tu@jabber.org)")
-    parser.add_argument("-s", "--mail-storage", required=True,
-                        help="Directorio de almacenamiento de correos")
+    parser.add_argument("--jid", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument("--notify", required=True)
+    parser.add_argument("-s", "--mail-storage", required=True)
     args = parser.parse_args()
+
+    print("=" * 60)
+    print("🔔 NOTIFICADOR XMPP")
+    print("=" * 60)
+    print(f"Bot JID:  {args.jid}")
+    print(f"Notifica: {args.notify}")
+    print(f"Storage:  {args.mail_storage}")
+    print("=" * 60)
 
     xmpp = MailNotifier(args.jid, args.password, args.notify, args.mail_storage)
     xmpp.connect()
-    xmpp.process(forever=True)
+
+    # Usar el loop interno que slixmpp ya creó
+    loop = xmpp.loop
+    try:
+        loop.run_until_complete(xmpp.disconnected)
+    except KeyboardInterrupt:
+        print("\n🛑 Deteniendo notificador...")
+        xmpp.disconnect()
 
 
 if __name__ == "__main__":
